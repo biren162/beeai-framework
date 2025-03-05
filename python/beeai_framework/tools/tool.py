@@ -83,7 +83,7 @@ class Tool(Generic[T], ABC):
         pass
 
     @abstractmethod
-    async def _run(self, input: Any, options: dict[str, Any] | None = None, context: RunContext | None = None) -> Any:
+    async def _run(self, input: Any, options: dict[str, Any], context: RunContext) -> Any:
         pass
 
     def validate_input(self, input: T | dict[str, Any]) -> T:
@@ -93,19 +93,21 @@ class Tool(Generic[T], ABC):
             raise ToolInputValidationError("Tool input validation error", cause=e)
 
     def run(self, input: T | dict[str, Any], options: dict[str, Any] | None = None) -> Run[T]:
+        run_options = options or {}
+
         async def run_tool(context: RunContext) -> T:
             error_propagated = False
 
             try:
                 validated_input = self.validate_input(input)
 
-                meta = {"input": validated_input, "options": options}
+                meta = {"input": validated_input, "options": run_options}
 
                 async def executor(_: RetryableContext) -> Any:
                     nonlocal error_propagated
                     error_propagated = False
                     await context.emitter.emit("start", meta)
-                    return await self._run(validated_input, options, context)
+                    return await self._run(validated_input, run_options, context)
 
                 async def on_error(error: Exception, _: RetryableContext) -> None:
                     nonlocal error_propagated
@@ -124,9 +126,7 @@ class Tool(Generic[T], ABC):
                         executor=executor,
                         on_error=on_error,
                         on_retry=on_retry,
-                        config=RetryableConfig(
-                            max_retries=options.get("max_retries", 1) if options else 1, signal=context.signal
-                        ),
+                        config=RetryableConfig(max_retries=run_options.get("max_retries", 1), signal=context.signal),
                     )
                 ).get()
 
@@ -135,14 +135,14 @@ class Tool(Generic[T], ABC):
             except Exception as e:
                 err = ToolError.ensure(e)
                 if not error_propagated:
-                    await context.emitter.emit("error", {"error": err, "input": input, "options": options})
+                    await context.emitter.emit("error", {"error": err, "input": input, "options": run_options})
                 raise err
             finally:
                 await context.emitter.emit("finish", None)
 
         return RunContext.enter(
             RunInstance(emitter=self.emitter),
-            RunContextInput(params=[input, options], signal=options.get("signal") if options else None),
+            RunContextInput(params=[input, run_options], signal=run_options.get("signal")),
             run_tool,
         )
 
@@ -194,7 +194,7 @@ def tool(tool_function: Callable) -> Tool:
                 creator=self,
             )
 
-        async def _run(self, tool_in: Any, _: dict[str, Any] | None = None, context: RunContext | None = None) -> None:
+        async def _run(self, tool_in: Any, options: dict[str, Any], context: RunContext) -> None:
             tool_input_dict = tool_in.model_dump()
             if inspect.iscoroutinefunction(tool_function):
                 return await tool_function(**tool_input_dict)
